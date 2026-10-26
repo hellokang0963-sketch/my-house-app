@@ -1,4 +1,4 @@
-# 檔案名稱：app.py (Render 雲端防崩潰輕量優化版)
+# 檔案名稱：app.py (智慧欄位自動匹配 + 雲端省記憶體最終版)
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -11,7 +11,6 @@ import re
 import gc
 from datetime import datetime
 
-# 忽略內政部網站 SSL 憑證警告 (避免國外雲端主機連線失敗)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="好房 AI 實價登錄估價網站")
@@ -33,16 +32,7 @@ CITY_CODE_MAP = {
     "金門縣": "w", "連江縣": "z"
 }
 
-# 輕量化快取 (只保留 1 個縣市，防止 Render 512MB 記憶體爆掉)
 CITY_DATA_CACHE = {}
-
-# 只讀取我們需要的 10 個欄位，節省 85% 記憶體！
-USE_COLS = [
-    '鄉鎮市區', '交易標的', '土地位置建物門牌', '交易年月日', '移轉層次',
-    '總樓層數', '建物型態', '建築完成年月', '建物移轉總面積平方公尺',
-    '建物現況格局-房', '建物現況格局-廳', '總價元', '車位移轉總面積(平方公尺)',
-    '車位總價元', '備註'
-]
 
 def normalize_address(addr: str) -> str:
     if not isinstance(addr, str): return ""
@@ -63,22 +53,27 @@ def parse_roc_date(date_str: str) -> int:
     except:
         return 0
 
+def get_col(df: pd.DataFrame, keyword: str, default_val=""):
+    """智慧尋找欄位：不管內政部有沒有加括號都能自動找到對應欄位"""
+    for c in df.columns:
+        if keyword in str(c):
+            return df[c]
+    return pd.Series([default_val] * len(df), index=df.index)
+
 def fetch_moi_online_data(city_code: str) -> pd.DataFrame:
     if city_code in CITY_DATA_CACHE:
         return CITY_DATA_CACHE[city_code]
 
-    # 清除舊縣市快取，確保 Render 免費版記憶體永遠夠用
     CITY_DATA_CACHE.clear()
     gc.collect()
 
     dfs = []
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "*/*"
     }
     target_filename = f"{city_code}_lvr_land_a.csv"
 
-    # 抓最新一期 + 最近兩季 (兼顧速度與記憶體安全)
     urls_to_fetch = ["https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip"]
     now = datetime.now()
     roc_year = now.year - 1911
@@ -86,9 +81,12 @@ def fetch_moi_online_data(city_code: str) -> pd.DataFrame:
         for s in [4, 3, 2, 1]:
             urls_to_fetch.append(f"https://plvr.land.moi.gov.tw/DownloadSeason?season={y}S{s}&type=zip&fileName=lvr_landcsv.zip")
 
+    # 只要欄位名稱包含這些關鍵字就保留，完美相容有沒有括號的版本
+    keep_keywords = ['鄉鎮市區', '交易標的', '門牌', '交易年月日', '移轉層次', '總樓層數', '建物型態', '建築完成', '建物移轉總面積', '格局-房', '格局-廳', '總價元', '車位移轉總面積', '車位總價元', '備註']
+
     success_seasons = 0
     for url in urls_to_fetch:
-        if success_seasons >= 3:  # 抓滿 3 個壓縮包即停止，避免超時與爆記憶體
+        if success_seasons >= 3:
             break
         try:
             resp = requests.get(url, headers=headers, timeout=25, verify=False)
@@ -98,13 +96,13 @@ def fetch_moi_online_data(city_code: str) -> pd.DataFrame:
                         with z.open(target_filename) as f:
                             sub_df = pd.read_csv(
                                 f, dtype=str,
-                                usecols=lambda c: c in USE_COLS,
+                                usecols=lambda c: any(k in str(c) for k in keep_keywords),
                                 on_bad_lines='skip'
                             )
                             if len(sub_df) > 1:
                                 sub_df = sub_df.iloc[1:].copy()
-                                # 先過濾非房地交易，大幅縮小記憶體
-                                sub_df = sub_df[sub_df['交易標的'].str.contains('房地', na=False)]
+                                target_type_s = get_col(sub_df, '交易標的', '')
+                                sub_df = sub_df[target_type_s.str.contains('房地', na=False)]
                                 dfs.append(sub_df)
                                 success_seasons += 1
             del resp
@@ -116,30 +114,48 @@ def fetch_moi_online_data(city_code: str) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
 
-    df = pd.concat(dfs, ignore_index=True)
+    raw_df = pd.concat(dfs, ignore_index=True)
     del dfs
     gc.collect()
 
-    df['clean_addr'] = df['土地位置建物門牌'].astype(str).apply(normalize_address)
-    df['total_ping'] = pd.to_numeric(df['建物移轉總面積平方公尺'], errors='coerce') * 0.3025
-    df['parking_ping'] = pd.to_numeric(df['車位移轉總面積(平方公尺)'], errors='coerce').fillna(0) * 0.3025
+    # 建立乾淨統一的標準化資料表
+    df = pd.DataFrame()
+    df['district'] = get_col(raw_df, '鄉鎮市區', '')
+    df['clean_addr'] = get_col(raw_df, '門牌', '').astype(str).apply(normalize_address)
+    df['date_str'] = get_col(raw_df, '交易年月日', '')
+    df['floor'] = get_col(raw_df, '移轉層次', '-')
+    df['total_floors'] = get_col(raw_df, '總樓層數', '-')
+    df['b_type'] = get_col(raw_df, '建物型態', '住宅大樓')
+    df['build_ym'] = get_col(raw_df, '建築完成', '')
+    df['rooms'] = get_col(raw_df, '格局-房', '3')
+    df['halls'] = get_col(raw_df, '格局-廳', '2')
+    df['note'] = get_col(raw_df, '備註', '')
+
+    df['total_ping'] = pd.to_numeric(get_col(raw_df, '建物移轉總面積', '0'), errors='coerce').fillna(0) * 0.3025
+    df['parking_ping'] = pd.to_numeric(get_col(raw_df, '車位移轉總面積', '0'), errors='coerce').fillna(0) * 0.3025
     df['house_ping'] = df['total_ping'] - df['parking_ping']
     
-    df['total_price'] = pd.to_numeric(df['總價元'], errors='coerce') / 10000
-    df['parking_price'] = pd.to_numeric(df['車位總價元'], errors='coerce').fillna(0) / 10000
+    df['total_price'] = pd.to_numeric(raw_df['總價元'] if '總價元' in raw_df.columns else get_col(raw_df, '總價元', '0'), errors='coerce').fillna(0) / 10000
+    df['parking_price'] = pd.to_numeric(get_col(raw_df, '車位總價元', '0'), errors='coerce').fillna(0) / 10000
 
-    # 向量化計算拆車位單價 (比 apply 快 10 倍且省記憶體)
-    has_park = (df['parking_price'] > 0) & (df['parking_ping'] > 0)
+    del raw_df
+    gc.collect()
+
+    # 當車位有計價但未登記車位坪數時，若房屋總坪數大於25坪，預設扣除標準車位坪數 8 坪以免稀釋單價
+    no_park_ping_mask = (df['parking_price'] > 0) & (df['parking_ping'] == 0) & (df['total_ping'] > 25)
+    df.loc[no_park_ping_mask, 'house_ping'] = df.loc[no_park_ping_mask, 'total_ping'] - 8.0
+
+    has_park = (df['parking_price'] > 0) & (df['house_ping'] > 1)
     df['real_unit_price'] = 0.0
     valid_house = df['house_ping'] > 1
     df.loc[valid_house & has_park, 'real_unit_price'] = (df['total_price'] - df['parking_price']) / df['house_ping']
     df.loc[valid_house & (~has_park), 'real_unit_price'] = df['total_price'] / df['total_ping']
 
-    df['month_val'] = df['交易年月日'].apply(parse_roc_date)
+    df['month_val'] = df['date_str'].apply(parse_roc_date)
 
-    df = df[~df['備註'].astype(str).str.contains('親友|特殊|急買|急賣|瑕疵|增建|政府', na=False)]
+    df = df[~df['note'].astype(str).str.contains('親友|特殊|急買|急賣|瑕疵|增建|政府', na=False)]
     df = df[(df['real_unit_price'] > 5) & (df['real_unit_price'] < 400)]
-    df = df.drop_duplicates(subset=['clean_addr', '交易年月日', '總價元'])
+    df = df.drop_duplicates(subset=['clean_addr', 'date_str', 'total_price'])
 
     CITY_DATA_CACHE[city_code] = df
     gc.collect()
@@ -158,7 +174,7 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
 
         df = fetch_moi_online_data(city_code)
         if df.empty:
-            return {"error": "內政部開放資料伺服器目前繁忙或阻擋雲端連線，請等待 10 秒後再按一次！"}
+            return {"error": "內政部開放資料伺服器目前繁忙，請等待 10 秒後再按一次！"}
 
         match = re.search(r'([臺台]北市|新北市|桃園市|[臺台]中市|[臺台]南市|高雄市|.{2}[縣市])?(.+?[區鄉鎮市])?(.+?[路街段])(\d+巷)?(\d+弄)?(\d+號)', clean_input)
         if not match:
@@ -183,12 +199,12 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
         if not target_source_df.empty:
             ref = target_source_df.iloc[0]
             target_ping = round(float(target_source_df['house_ping'].median()), 1) if custom_ping <= 0 else custom_ping
-            build_ym = str(ref.get('建築完成年月', ''))
+            build_ym = str(ref['build_ym'])
             build_y = int(build_ym[:-4]) if len(build_ym) >= 5 and build_ym[:-4].isdigit() else (current_roc_year - 15)
             target_age = max(1, current_roc_year - build_y)
-            total_floors = str(ref.get('總樓層數', '未知'))
-            b_type = str(ref.get('建物型態', '住宅大樓')).split('(')[0]
-            layout = f"{ref.get('建物現況格局-房', '3')}房{ref.get('建物現況格局-廳', '2')}廳"
+            total_floors = str(ref['total_floors'])
+            b_type = str(ref['b_type']).split('(')[0]
+            layout = f"{ref['rooms']}房{ref['halls']}廳"
             source_msg = f"✅ 已從內政部實價庫自動配對同社區【{ref['clean_addr']}】之真實規格"
         else:
             road_matches = df[df['clean_addr'].str.contains(road, na=False, regex=False)]
@@ -196,8 +212,8 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
                 return {"error": f"查無『{road}』之近期實價登錄，請確認縣市與路名是否正確。"}
             target_ping = round(float(road_matches['house_ping'].median()), 1) if custom_ping <= 0 else custom_ping
             target_age = 15
-            total_floors = str(road_matches.iloc[0].get('總樓層數', '未知'))
-            b_type = str(road_matches.iloc[0].get('建物型態', '住宅大樓')).split('(')[0]
+            total_floors = str(road_matches.iloc[0]['total_floors'])
+            b_type = str(road_matches.iloc[0]['b_type']).split('(')[0]
             layout = "標準格局"
             source_msg = f"ℹ️ 該門牌近期無交易，已帶入『{road}』標準坪數（可於上方手動微調）"
 
@@ -214,8 +230,8 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
 
         if len(comps) < 5 and district:
             comps = df[
-                (df['鄉鎮市區'] == district) &
-                (df['建物型態'].str.contains(b_type[:2], na=False, regex=False)) &
+                (df['district'] == district) &
+                (df['b_type'].str.contains(b_type[:2], na=False, regex=False)) &
                 (df['month_val'] >= max_m - 12) &
                 (df['house_ping'] >= min_ping) &
                 (df['house_ping'] <= max_ping)
@@ -233,18 +249,18 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
 
         comp_list = []
         for _, r in comps.head(30).iterrows():
-            d_str = str(r['交易年月日'])
+            d_str = str(r['date_str'])
             f_date = f"{d_str[:-4]}/{d_str[-4:-2]}" if len(d_str) >= 5 else d_str
             comp_list.append({
                 "date": f_date,
                 "addr": r['clean_addr'],
                 "ping": round(float(r['house_ping']), 1),
                 "total_ping": round(float(r['total_ping']), 1),
-                "floor": f"{r.get('移轉層次', '-')} / {r.get('總樓層數', '-')}",
+                "floor": f"{r['floor']} / {r['total_floors']}",
                 "unit": round(float(r['real_unit_price']), 1),
                 "total": round(float(r['total_price']), 0),
                 "park": round(float(r['parking_price']), 0),
-                "layout": f"{r.get('建物現況格局-房', '-')}房{r.get('建物現況格局-廳', '-')}廳",
+                "layout": f"{r['rooms']}房{r['halls']}廳",
                 "is_same": bool(r['is_same'])
             })
 
@@ -260,7 +276,7 @@ def analyze(address: str = Query(...), custom_ping: float = Query(0), range_rati
                 "avg_u": avg_u, "low_u": low_u, "med_u": med_u, "high_u": high_u,
                 "low_t": round(low_u * target_ping),
                 "med_t": round(med_u * target_ping),
-                "high_t": round(high_unit * target_ping) if 'high_unit' in locals() else round(high_u * target_ping)
+                "high_t": round(high_u * target_ping)
             },
             "comps": comp_list
         }
@@ -292,7 +308,7 @@ def web_portal():
                 <div class="bg-blue-600 p-2 rounded-lg"><i class="fa-solid fa-building-wheat text-xl text-white"></i></div>
                 <div>
                     <span class="font-black text-lg tracking-wide">好房 AI 實價估價網</span>
-                    <span class="hidden md:inline-block ml-2 text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 px-2 py-0.5 rounded-full">雲端省記憶體極速版</span>
+                    <span class="hidden md:inline-block ml-2 text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 px-2 py-0.5 rounded-full">內政部實價登錄即時直連</span>
                 </div>
             </div>
         </div>
@@ -524,44 +540,4 @@ function renderChart(d) {
         },
         options: {
             responsive: true, maintainAspectRatio: false,
-            plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.raw.addr}：${ctx.raw.x}坪 / 單價 ${ctx.raw.y}萬` } } },
-            scales: { x: { title: { display: true, text: '扣車位坪數 (坪)' } }, y: { title: { display: true, text: '拆算單價 (萬/坪)' } } }
-        }
-    });
-}
-
-function filterTable(mode) {
-    if (!globalData) return;
-    const tbody = document.getElementById('tableBody');
-    tbody.innerHTML = '';
-    document.getElementById('btnAll').className = mode === 'all' ? "text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-600 text-white" : "text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600";
-    document.getElementById('btnSame').className = mode === 'same' ? "text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-600 text-white" : "text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600";
-
-    const list = mode === 'same' ? globalData.comps.filter(c => c.is_same) : globalData.comps;
-    if (list.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">無符合此篩選條件之交易紀錄</td></tr>`;
-        return;
-    }
-    list.forEach(c => {
-        const badge = c.is_same ? `<span class="bg-blue-600 text-white text-[10px] px-2 py-0.5 rounded font-bold">同社區/鄰近</span>` : `<span class="bg-slate-100 text-slate-600 text-[10px] px-2 py-0.5 rounded font-semibold">周邊相似</span>`;
-        const parkNote = c.park > 0 ? `<span class="block text-[10px] text-slate-400">含車位${c.park}萬</span>` : ``;
-        tbody.innerHTML += `
-            <tr class="hover:bg-slate-50 ${c.is_same ? 'bg-blue-50/40' : ''}">
-                <td class="py-3 px-2 whitespace-nowrap">${badge}</td>
-                <td class="py-3 px-2 font-semibold text-slate-600">${c.date}</td>
-                <td class="py-3 px-2 font-bold text-slate-800">${c.addr}</td>
-                <td class="py-3 px-2 text-right font-bold text-blue-700">${c.ping} 坪</td>
-                <td class="py-3 px-2 text-center text-slate-500">${c.floor}</td>
-                <td class="py-3 px-2 text-right font-black text-red-600">${c.unit} 萬/坪</td>
-                <td class="py-3 px-2 text-right font-bold text-slate-900">${c.total.toLocaleString()} 萬 ${parkNote}</td>
-            </tr>`;
-    });
-}
-</script>
-</body>
-</html>
-"""
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+            plugins: { tooltip: { callbacks: { label: (ctx) => `${c
