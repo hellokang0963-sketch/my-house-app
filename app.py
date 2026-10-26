@@ -540,4 +540,44 @@ function renderChart(d) {
         },
         options: {
             responsive: true, maintainAspectRatio: false,
-            plugins: { tooltip: { callbacks: { label: (ctx) => `${c
+            plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.raw.addr}：${ctx.raw.x}坪 / 單價 ${ctx.raw.y}萬` } } },
+            scales: { x: { title: { display: true, text: '扣車位坪數 (坪)' } }, y: { title: { display: true, text: '拆算單價 (萬/坪)' } } }
+        }
+    });
+}
+
+function filterTable(mode) {
+    if (!globalData) return;
+    const tbody = document.getElementById('tableBody');
+    tbody.innerHTML = '';
+    document.getElementById('btnAll').className = mode === 'all' ? "text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-600 text-white" : "text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600";
+    document.getElementById('btnSame').className = mode === 'same' ? "text-xs font-bold px-3 py-1.5 rounded-lg bg-blue-600 text-white" : "text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600";
+
+    const list = mode === 'same' ? globalData.comps.filter(c => c.is_same) : globalData.comps;
+    if (list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center py-6 text-slate-400">無符合此篩選條件之交易紀錄</td></tr>`;
+        return;
+    }
+    list.forEach(c => {
+        const badge = c.is_same ? `<span class="bg-blue-600 text-white text-[10px] px-2 py-0.5 rounded font-bold">同社區/鄰近</span>` : `<span class="bg-slate-100 text-slate-600 text-[10px] px-2 py-0.5 rounded font-semibold">周邊相似</span>`;
+        const parkNote = c.park > 0 ? `<span class="block text-[10px] text-slate-400">含車位${c.park}萬</span>` : ``;
+        tbody.innerHTML += `
+            <tr class="hover:bg-slate-50 ${c.is_same ? 'bg-blue-50/40' : ''}">
+                <td class="py-3 px-2 whitespace-nowrap">${badge}</td>
+                <td class="py-3 px-2 font-semibold text-slate-600">${c.date}</td>
+                <td class="py-3 px-2 font-bold text-slate-800">${c.addr}</td>
+                <td class="py-3 px-2 text-right font-bold text-blue-700">${c.ping} 坪</td>
+                <td class="py-3 px-2 text-center text-slate-500">${c.floor}</td>
+                <td class="py-3 px-2 text-right font-black text-red-600">${c.unit} 萬/坪</td>
+                <td class="py-3 px-2 text-right font-bold text-slate-900">${c.total.toLocaleString()} 萬 ${parkNote}</td>
+            </tr>`;
+    });
+}
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
